@@ -155,7 +155,7 @@ class MetadataRemoverApp:
             "EXIF": tk.BooleanVar(),
             "IPTC": tk.BooleanVar(),
             "XMP": tk.BooleanVar(),
-            "C2PA": tk.BooleanVar(),
+            "C2PA (AI made)": tk.BooleanVar(),
         }
 
         for k, v in self.meta_vars.items():
