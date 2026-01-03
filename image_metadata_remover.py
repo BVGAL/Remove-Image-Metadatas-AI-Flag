@@ -1,113 +1,267 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import Union, Dict, Any, List, Tuple
+from typing import Optional, Dict
 
 import os
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 
+# ---------------- OPTIONAL LIBS ----------------
+
+try:
+    import piexif  # type: ignore
+    HAS_PIEXIF = True
+except Exception:
+    piexif = None
+    HAS_PIEXIF = False
+
+try:
+    from iptcinfo3 import IPTCInfo  # type: ignore
+    HAS_IPTC = True
+except Exception:
+    IPTCInfo = None
+    HAS_IPTC = False
+
+try:
+    from libxmp import XMPFiles  # type: ignore
+    HAS_XMP = True
+except Exception:
+    XMPFiles = None
+    HAS_XMP = False
+
+try:
+    from c2pa.c2pa import Reader  # type: ignore
+    HAS_C2PA = True
+except Exception:
+    Reader = None
+    HAS_C2PA = False
+
 
 # =========================================================
-# C2PA DETECTION UTILITIES
+# METADATA DETECTION
 # =========================================================
 
-def _parse_jpeg_segments(data: bytes) -> List[Tuple[int, bytes]]:
-    """Parse JPEG segments and return (marker, payload)."""
-    if len(data) < 4 or data[:2] != b"\xFF\xD8":
-        return []
-
-    segments = []
-    i = 2
-    n = len(data)
-
-    while i + 4 <= n:
-        if data[i] != 0xFF:
-            i += 1
-            continue
-        while i < n and data[i] == 0xFF:
-            i += 1
-        if i >= n:
-            break
-
-        marker = data[i]
-        i += 1
-
-        if marker in (0xD9, 0xDA):  # EOI / SOS
-            break
-
-        if i + 2 > n:
-            break
-        seg_len = int.from_bytes(data[i:i+2], "big")
-        i += 2
-        if seg_len < 2 or i + seg_len - 2 > n:
-            break
-
-        payload = data[i:i + seg_len - 2]
-        i += seg_len - 2
-        segments.append((marker, payload))
-
-    return segments
-
-
-def has_c2pa_metadata(path: Union[str, Path]) -> Dict[str, Any]:
+def detect_exif(path: str) -> Dict[str, bool]:
     """
-    Detect C2PA / Content Credentials.
-    Returns: { has_c2pa: bool, status: 'yes'|'maybe'|'no', signals: [...] }
+    Returns:
+    {
+        "present": bool,
+        "strong_camera": bool
+    }
+
+    strong_camera=True only when Make + Model + DateTimeOriginal exist.
+    This avoids classifying converted/exported JPEGs as "real camera" photos.
     """
-    data = Path(path).read_bytes()
-    lower = data.lower()
-    signals: List[str] = []
+    if not HAS_PIEXIF or piexif is None:
+        return {"present": False, "strong_camera": False}
 
-    is_jpeg = data[:2] == b"\xFF\xD8"
-    is_png = data[:8] == b"\x89PNG\r\n\x1a\n"
-    is_webp = data[:4] == b"RIFF" and data[8:12] == b"WEBP"
-    is_isobmff = len(data) > 12 and data[4:8] == b"ftyp"
+    try:
+        meta = piexif.load(path)
+        zeroth = meta.get("0th", {}) or {}
+        exif = meta.get("Exif", {}) or {}
+        gps = meta.get("GPS", {}) or {}
 
-    if is_jpeg:
-        signals.append("container:jpeg")
-        segments = _parse_jpeg_segments(data)
-        app11 = [p for m, p in segments if m == 0xEB]
-        if app11:
-            signals.append(f"jpeg:app11_count={len(app11)}")
-            for p in app11:
-                if b"jumb" in p.lower():
-                    signals.append("jpeg:jumb_found")
-                    return {"has_c2pa": True, "status": "yes", "signals": signals}
-            return {"has_c2pa": False, "status": "maybe", "signals": signals}
+        present = any(
+            isinstance(meta.get(k, {}), dict) and len(meta.get(k, {})) > 0
+            for k in ("0th", "Exif", "GPS", "1st", "Interop")
+        ) or bool(meta.get("thumbnail"))
 
-    if is_isobmff:
-        signals.append("container:isobmff")
-        if b"jumb" in data:
-            signals.append("isobmff:jumb_found")
-            return {"has_c2pa": True, "status": "yes", "signals": signals}
-        return {"has_c2pa": False, "status": "maybe", "signals": signals}
+        make = zeroth.get(piexif.ImageIFD.Make)
+        model = zeroth.get(piexif.ImageIFD.Model)
+        dt = exif.get(piexif.ExifIFD.DateTimeOriginal) or zeroth.get(piexif.ImageIFD.DateTime)
 
-    if is_png:
-        signals.append("container:png")
-        if b"xmp" in lower:
-            signals.append("png:xmp_present")
-        if b"c2pa" in lower or b"urn:c2pa:" in lower:
-            signals.append("png:c2pa_string")
-            return {"has_c2pa": True, "status": "yes", "signals": signals}
-        if "png:xmp_present" in signals:
-            return {"has_c2pa": False, "status": "maybe", "signals": signals}
+        # Some exporters set Make/Model to empty bytes; normalize
+        def _has_value(x) -> bool:
+            if x is None:
+                return False
+            if isinstance(x, bytes):
+                return len(x.strip()) > 0
+            if isinstance(x, str):
+                return len(x.strip()) > 0
+            return True
 
-    if is_webp:
-        signals.append("container:webp")
-        if b"xmp" in lower:
-            signals.append("webp:xmp_present")
-        if b"c2pa" in lower or b"urn:c2pa:" in lower:
-            signals.append("webp:c2pa_string")
-            return {"has_c2pa": True, "status": "yes", "signals": signals}
-        if "webp:xmp_present" in signals:
-            return {"has_c2pa": False, "status": "maybe", "signals": signals}
+        strong_camera = _has_value(make) and _has_value(model) and _has_value(dt)
 
-    if b"urn:c2pa:" in lower or b"contentcredentials" in lower:
-        signals.append("generic:c2pa_string")
-        return {"has_c2pa": True, "status": "yes", "signals": signals}
+        # If GPS exists, we don't automatically call it "strong camera",
+        # but it increases confidence that it's camera-ish; still requires Make/Model/DateTime.
+        _ = gps  # kept for future expansion
 
-    return {"has_c2pa": False, "status": "no", "signals": signals}
+        return {"present": bool(present), "strong_camera": bool(strong_camera)}
+    except Exception:
+        # piexif raises "Given file is neither JPEG nor TIFF." for PNG/WebP/etc.
+        return {"present": False, "strong_camera": False}
+
+
+def detect_iptc(path: str) -> bool:
+    """
+    IPTC (IIM) best-effort via iptcinfo3.
+
+    iptcinfo3 objects are not guaranteed to behave like dicts and may not expose .items().
+    We'll probe known internal storage and fallback to a conservative scan.
+    """
+    if not HAS_IPTC or IPTCInfo is None:
+        return False
+
+    try:
+        info = IPTCInfo(path, force=True)
+
+        # Newer/other builds keep data in attributes like 'data' or '_data'
+        for attr in ("data", "_data"):
+            d = getattr(info, attr, None)
+            if isinstance(d, dict) and any(v not in (None, b"", "", [], ()) for v in d.values()):
+                return True
+
+        # Fallback: check instance dict for any non-empty value
+        dct = getattr(info, "__dict__", {}) or {}
+        if any(v not in (None, b"", "", [], ()) for v in dct.values()):
+            return True
+
+        return False
+    except Exception:
+        return False
+
+
+def detect_xmp(path: str) -> bool:
+    """
+    XMP via python-xmp-toolkit (libxmp).
+    On Windows/macOS this may require Exempi; if missing, it will fail and we return False.
+    """
+    if not HAS_XMP or XMPFiles is None:
+        return False
+
+    xf = None
+    try:
+        xf = XMPFiles(file_path=path)
+        xmp = xf.get_xmp()
+        return xmp is not None
+    except Exception:
+        return False
+    finally:
+        try:
+            if xf is not None:
+                xf.close_file()
+        except Exception:
+            pass
+
+
+def detect_c2pa(path: str) -> str:
+    """
+    returns: "yes" | "maybe" | "no"
+    Uses c2pa-python when available, otherwise a conservative heuristic.
+    """
+    if HAS_C2PA and Reader is not None:
+        try:
+            r = Reader(path)
+
+            store = None
+            if hasattr(r, "get_manifest_store"):
+                store = r.get_manifest_store()
+            elif hasattr(r, "manifest_store"):
+                store = r.manifest_store
+
+            # If store exists and is non-empty, we treat as YES
+            if store:
+                return "yes"
+        except Exception:
+            pass
+
+    # fallback heuristic (conservative)
+    try:
+        data = Path(path).read_bytes().lower()
+        # "jumb" is a common JUMBF signature; "urn:c2pa:" can appear in some embeddings
+        if b"jumb" in data or b"urn:c2pa:" in data or b"contentcredentials" in data:
+            return "maybe"
+    except Exception:
+        pass
+
+    return "no"
+
+
+# =========================================================
+# AI LIKELIHOOD SUMMARY + BADGE
+# =========================================================
+
+def summarize_ai_likelihood(
+    exif_present: bool,
+    strong_camera_exif: bool,
+    iptc: bool,
+    xmp: bool,
+    c2pa: str
+) -> Dict[str, str]:
+    """
+    Returns:
+    {
+        "level": "high" | "medium" | "low" | "unknown",
+        "text": "...",
+        "color": "#RRGGBB"
+    }
+    """
+
+    # Strongest signal
+    if c2pa == "yes":
+        return {
+            "level": "high",
+            "color": "#c0392b",  # red
+            "text": (
+                "This image contains Content Credentials (C2PA).\n"
+                "It was likely generated or modified using AI-based tools."
+            )
+        }
+
+    # Partial / weak C2PA hints
+    if c2pa == "maybe":
+        return {
+            "level": "medium",
+            "color": "#f1c40f",  # yellow
+            "text": (
+                "This image shows partial Content Credentials signals.\n"
+                "It may have been generated or modified using AI-based tools."
+            )
+        }
+
+    # EXIF exists but is not coherent as a real camera capture (common after PNG->JPG conversions)
+    if exif_present and not strong_camera_exif:
+        return {
+            "level": "medium",
+            "color": "#f1c40f",  # yellow
+            "text": (
+                "This image contains generic metadata but no coherent camera information.\n"
+                "It may have been generated or modified using software, including AI."
+            )
+        }
+
+    # Strong camera EXIF
+    if exif_present and strong_camera_exif:
+        return {
+            "level": "low",
+            "color": "#27ae60",  # green
+            "text": (
+                "This image contains coherent camera metadata.\n"
+                "There are no metadata-based indications that it was generated by AI."
+            )
+        }
+
+    # Editing metadata without camera EXIF
+    if xmp or iptc:
+        return {
+            "level": "medium",
+            "color": "#f1c40f",  # yellow
+            "text": (
+                "This image contains editing metadata but no camera information.\n"
+                "It may have been generated or modified using software, including AI."
+            )
+        }
+
+    # No meaningful metadata
+    return {
+        "level": "unknown",
+        "color": "#7f8c8d",  # gray
+        "text": (
+            "This image does not contain meaningful metadata.\n"
+            "It is not possible to determine whether it was generated by AI based on metadata alone."
+        )
+    }
 
 
 # =========================================================
@@ -120,9 +274,9 @@ class MetadataRemoverApp:
         self.root.title("Image Metadata Inspector & Cleaner")
         self.root.geometry("900x600")
 
-        self.original_image: Image.Image | None = None
-        self.clean_image: Image.Image | None = None
-        self.image_path: str | None = None
+        self.image_path: Optional[str] = None
+        self.original_image: Optional[Image.Image] = None
+        self.clean_image: Optional[Image.Image] = None
 
         self._build_ui()
 
@@ -142,29 +296,53 @@ class MetadataRemoverApp:
         content = tk.Frame(main)
         content.pack(expand=True, fill=tk.BOTH, pady=10)
 
-        self.preview = tk.Label(content, text="Upload an image", bg="#ddd")
+        # LEFT preview
+        self.preview = tk.Label(content, bg="#ddd", text="Upload an image")
         self.preview.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=(0, 10))
 
-        meta = tk.Frame(content, width=250, bd=1, relief=tk.SUNKEN)
-        meta.pack(side=tk.RIGHT, fill=tk.Y)
-        meta.pack_propagate(False)
+        # RIGHT panel (wider)
+        side = tk.Frame(content, width=340, bd=1, relief=tk.SUNKEN)
+        side.pack(side=tk.RIGHT, fill=tk.Y)
+        side.pack_propagate(False)
 
-        tk.Label(meta, text="Metadata detected", font=("Helvetica", 12, "bold")).pack(pady=10)
+        tk.Label(side, text="Metadata detected", font=("Helvetica", 12, "bold")).pack(pady=(10, 6))
 
         self.meta_vars = {
             "EXIF": tk.BooleanVar(),
             "IPTC": tk.BooleanVar(),
             "XMP": tk.BooleanVar(),
-            "C2PA (AI made)": tk.BooleanVar(),
+            "C2PA": tk.BooleanVar(),
         }
 
         for k, v in self.meta_vars.items():
-            tk.Checkbutton(meta, text=k, variable=v, state=tk.DISABLED).pack(anchor="w", padx=10)
+            tk.Checkbutton(side, text=k, variable=v, state=tk.DISABLED).pack(anchor="w", padx=12)
+
+        tk.Label(side, text="AI Likelihood", font=("Helvetica", 12, "bold")).pack(pady=(14, 6))
+
+        self.badge = tk.Label(
+            side,
+            text="—",
+            fg="white",
+            bg="#7f8c8d",
+            font=("Helvetica", 10, "bold"),
+            padx=10,
+            pady=5
+        )
+        self.badge.pack(padx=12, pady=(0, 10), fill=tk.X)
+
+        tk.Label(side, text="Additional Info", font=("Helvetica", 12, "bold")).pack(pady=(10, 6))
+
+        self.additional_info = tk.Text(side, height=10, wrap="word", state=tk.DISABLED)
+        self.additional_info.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
 
         self.status = tk.Label(main, text="Ready", bd=1, relief=tk.SUNKEN, anchor=tk.W)
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
 
-    # -----------------------------------------------------
+    def _set_additional_info(self, text: str):
+        self.additional_info.config(state=tk.NORMAL)
+        self.additional_info.delete("1.0", tk.END)
+        self.additional_info.insert(tk.END, text)
+        self.additional_info.config(state=tk.DISABLED)
 
     def upload_image(self):
         path = filedialog.askopenfilename(
@@ -176,61 +354,61 @@ class MetadataRemoverApp:
         try:
             self.image_path = path
             self.original_image = Image.open(path)
-            preview = self.original_image.copy()
-            preview.thumbnail((550, 550))
-            self.tk_img = ImageTk.PhotoImage(preview)
+
+            thumb = self.original_image.copy()
+            thumb.thumbnail((500, 500))
+            self.tk_img = ImageTk.PhotoImage(thumb)
             self.preview.config(image=self.tk_img, text="")
+
             self.run_btn.config(state=tk.NORMAL)
             self.save_btn.config(state=tk.DISABLED)
             self.clean_image = None
+
             self.detect_metadata()
             self.status.config(text=f"Loaded: {os.path.basename(path)}")
+
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
-    # -----------------------------------------------------
-
     def detect_metadata(self):
-        for v in self.meta_vars.values():
-            v.set(False)
-
-        if not self.original_image or not self.image_path:
+        if not self.image_path:
             return
 
-        if self.original_image.getexif():
-            self.meta_vars["EXIF"].set(True)
+        exif_res = detect_exif(self.image_path)
+        exif_present = exif_res["present"]
+        strong_camera = exif_res["strong_camera"]
 
-        info = self.original_image.info
-        if "iptc" in info:
-            self.meta_vars["IPTC"].set(True)
-        if "xmp" in info or "XML:com.adobe.xmp" in info:
-            self.meta_vars["XMP"].set(True)
+        iptc_present = detect_iptc(self.image_path)
+        xmp_present = detect_xmp(self.image_path)
+        c2pa_status = detect_c2pa(self.image_path)
 
-        c2pa = has_c2pa_metadata(self.image_path)
-        if c2pa["status"] in ("yes", "maybe"):
-            self.meta_vars["C2PA"].set(True)
+        # Checkbox states
+        self.meta_vars["EXIF"].set(exif_present)
+        self.meta_vars["IPTC"].set(iptc_present)
+        self.meta_vars["XMP"].set(xmp_present)
+        self.meta_vars["C2PA"].set(c2pa_status in ("yes", "maybe"))
 
-        self.status.config(
-            text=f"C2PA status: {c2pa['status']} | signals: {', '.join(c2pa['signals'])}"
+        summary = summarize_ai_likelihood(
+            exif_present=exif_present,
+            strong_camera_exif=strong_camera,
+            iptc=iptc_present,
+            xmp=xmp_present,
+            c2pa=c2pa_status
         )
 
-    # -----------------------------------------------------
+        self.badge.config(text=summary["level"].upper(), bg=summary["color"])
+        self._set_additional_info(summary["text"])
 
     def process_image(self):
         if not self.original_image:
             return
-        try:
-            self.clean_image = Image.frombytes(
-                self.original_image.mode,
-                self.original_image.size,
-                self.original_image.tobytes(),
-            )
-            self.save_btn.config(state=tk.NORMAL)
-            self.status.config(text="Image processed (pixel-only, metadata removed)")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-
-    # -----------------------------------------------------
+        self.clean_image = Image.frombytes(
+            self.original_image.mode,
+            self.original_image.size,
+            self.original_image.tobytes()
+        )
+        self.save_btn.config(state=tk.NORMAL)
+        self.status.config(text="Processed: pixel-only copy created.")
 
     def download_image(self):
         if not self.clean_image or not self.image_path:
@@ -239,18 +417,13 @@ class MetadataRemoverApp:
         base, ext = os.path.splitext(os.path.basename(self.image_path))
         out = filedialog.asksaveasfilename(
             initialfile=f"{base}_clean{ext}",
-            defaultextension=ext,
-            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("All files", "*.*")]
+            defaultextension=ext
         )
         if not out:
             return
 
-        try:
-            self.clean_image.save(out)
-            self.status.config(text=f"Saved: {os.path.basename(out)}")
-            messagebox.showinfo("Done", "Image saved successfully")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+        self.clean_image.save(out)
+        self.status.config(text=f"Saved: {os.path.basename(out)}")
 
 
 # =========================================================
