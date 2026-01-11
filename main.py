@@ -39,6 +39,42 @@ except Exception:
 
 
 # =========================================================
+# SAVE HELPER (FIXED)
+# =========================================================
+
+def save_image_safely(img: Image.Image, out_path: str, jpg_bg=(255, 255, 255)) -> None:
+    """
+    Save an image to out_path handling format quirks (e.g. RGBA -> JPEG).
+    - If saving as JPEG and image has alpha, composite on a background first.
+    """
+    ext = Path(out_path).suffix.lower()
+    is_jpeg = ext in (".jpg", ".jpeg")
+
+    if is_jpeg:
+        # JPEG doesn't support alpha -> ensure RGB
+        if img.mode in ("RGBA", "LA"):
+            bg = Image.new("RGB", img.size, jpg_bg)
+            alpha = img.split()[-1]
+            bg.paste(img.convert("RGB"), mask=alpha)
+            img = bg
+        elif img.mode == "P":
+            # Palette images can have transparency
+            rgba = img.convert("RGBA")
+            bg = Image.new("RGB", rgba.size, jpg_bg)
+            alpha = rgba.split()[-1]
+            bg.paste(rgba.convert("RGB"), mask=alpha)
+            img = bg
+        else:
+            img = img.convert("RGB")
+
+        img.save(out_path, format="JPEG", quality=95, optimize=True, progressive=True)
+        return
+
+    # Other formats (PNG/WebP/...) -> save normally (keeps alpha if supported)
+    img.save(out_path)
+
+
+# =========================================================
 # METADATA DETECTION
 # =========================================================
 
@@ -71,7 +107,6 @@ def detect_exif(path: str) -> Dict[str, bool]:
         model = zeroth.get(piexif.ImageIFD.Model)
         dt = exif.get(piexif.ExifIFD.DateTimeOriginal) or zeroth.get(piexif.ImageIFD.DateTime)
 
-        # Some exporters set Make/Model to empty bytes; normalize
         def _has_value(x) -> bool:
             if x is None:
                 return False
@@ -82,23 +117,16 @@ def detect_exif(path: str) -> Dict[str, bool]:
             return True
 
         strong_camera = _has_value(make) and _has_value(model) and _has_value(dt)
-
-        # If GPS exists, we don't automatically call it "strong camera",
-        # but it increases confidence that it's camera-ish; still requires Make/Model/DateTime.
         _ = gps  # kept for future expansion
 
         return {"present": bool(present), "strong_camera": bool(strong_camera)}
     except Exception:
-        # piexif raises "Given file is neither JPEG nor TIFF." for PNG/WebP/etc.
         return {"present": False, "strong_camera": False}
 
 
 def detect_iptc(path: str) -> bool:
     """
     IPTC (IIM) best-effort via iptcinfo3.
-
-    iptcinfo3 objects are not guaranteed to behave like dicts and may not expose .items().
-    We'll probe known internal storage and fallback to a conservative scan.
     """
     if not HAS_IPTC or IPTCInfo is None:
         return False
@@ -106,13 +134,11 @@ def detect_iptc(path: str) -> bool:
     try:
         info = IPTCInfo(path, force=True)
 
-        # Newer/other builds keep data in attributes like 'data' or '_data'
         for attr in ("data", "_data"):
             d = getattr(info, attr, None)
             if isinstance(d, dict) and any(v not in (None, b"", "", [], ()) for v in d.values()):
                 return True
 
-        # Fallback: check instance dict for any non-empty value
         dct = getattr(info, "__dict__", {}) or {}
         if any(v not in (None, b"", "", [], ()) for v in dct.values()):
             return True
@@ -125,7 +151,6 @@ def detect_iptc(path: str) -> bool:
 def detect_xmp(path: str) -> bool:
     """
     XMP via python-xmp-toolkit (libxmp).
-    On Windows/macOS this may require Exempi; if missing, it will fail and we return False.
     """
     if not HAS_XMP or XMPFiles is None:
         return False
@@ -160,16 +185,13 @@ def detect_c2pa(path: str) -> str:
             elif hasattr(r, "manifest_store"):
                 store = r.manifest_store
 
-            # If store exists and is non-empty, we treat as YES
             if store:
                 return "yes"
         except Exception:
             pass
 
-    # fallback heuristic (conservative)
     try:
         data = Path(path).read_bytes().lower()
-        # "jumb" is a common JUMBF signature; "urn:c2pa:" can appear in some embeddings
         if b"jumb" in data or b"urn:c2pa:" in data or b"contentcredentials" in data:
             return "maybe"
     except Exception:
@@ -189,74 +211,60 @@ def summarize_ai_likelihood(
     xmp: bool,
     c2pa: str
 ) -> Dict[str, str]:
-    """
-    Returns:
-    {
-        "level": "high" | "medium" | "low" | "unknown",
-        "text": "...",
-        "color": "#RRGGBB"
-    }
-    """
 
-    # Strongest signal
     if c2pa == "yes":
         return {
             "level": "high",
-            "color": "#c0392b",  # red
+            "color": "#c0392b",
             "text": (
                 "This image contains Content Credentials (C2PA).\n"
                 "It was likely generated or modified using AI-based tools."
             )
         }
 
-    # Partial / weak C2PA hints
     if c2pa == "maybe":
         return {
             "level": "medium",
-            "color": "#f1c40f",  # yellow
+            "color": "#f1c40f",
             "text": (
                 "This image shows partial Content Credentials signals.\n"
                 "It may have been generated or modified using AI-based tools."
             )
         }
 
-    # EXIF exists but is not coherent as a real camera capture (common after PNG->JPG conversions)
     if exif_present and not strong_camera_exif:
         return {
             "level": "medium",
-            "color": "#f1c40f",  # yellow
+            "color": "#f1c40f",
             "text": (
                 "This image contains generic metadata but no coherent camera information.\n"
                 "It may have been generated or modified using software, including AI."
             )
         }
 
-    # Strong camera EXIF
     if exif_present and strong_camera_exif:
         return {
             "level": "low",
-            "color": "#27ae60",  # green
+            "color": "#27ae60",
             "text": (
                 "This image contains coherent camera metadata.\n"
                 "There are no metadata-based indications that it was generated by AI."
             )
         }
 
-    # Editing metadata without camera EXIF
     if xmp or iptc:
         return {
             "level": "medium",
-            "color": "#f1c40f",  # yellow
+            "color": "#f1c40f",
             "text": (
                 "This image contains editing metadata but no camera information.\n"
                 "It may have been generated or modified using software, including AI."
             )
         }
 
-    # No meaningful metadata
     return {
         "level": "unknown",
-        "color": "#7f8c8d",  # gray
+        "color": "#7f8c8d",
         "text": (
             "This image does not contain meaningful metadata.\n"
             "It is not possible to determine whether it was generated by AI based on metadata alone."
@@ -296,11 +304,9 @@ class MetadataRemoverApp:
         content = tk.Frame(main)
         content.pack(expand=True, fill=tk.BOTH, pady=10)
 
-        # LEFT preview
         self.preview = tk.Label(content, bg="#ddd", text="Upload an image")
         self.preview.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=(0, 10))
 
-        # RIGHT panel (wider)
         side = tk.Frame(content, width=340, bd=1, relief=tk.SUNKEN)
         side.pack(side=tk.RIGHT, fill=tk.Y)
         side.pack_propagate(False)
@@ -382,7 +388,6 @@ class MetadataRemoverApp:
         xmp_present = detect_xmp(self.image_path)
         c2pa_status = detect_c2pa(self.image_path)
 
-        # Checkbox states
         self.meta_vars["EXIF"].set(exif_present)
         self.meta_vars["IPTC"].set(iptc_present)
         self.meta_vars["XMP"].set(xmp_present)
@@ -414,16 +419,25 @@ class MetadataRemoverApp:
         if not self.clean_image or not self.image_path:
             return
 
-        base, ext = os.path.splitext(os.path.basename(self.image_path))
+        base, _ = os.path.splitext(os.path.basename(self.image_path))
+
         out = filedialog.asksaveasfilename(
-            initialfile=f"{base}_clean{ext}",
-            defaultextension=ext
+            initialfile=f"{base}_clean.jpg",
+            defaultextension=".jpg",
+            filetypes=[
+                ("JPEG", "*.jpg;*.jpeg"),
+                ("PNG", "*.png"),
+                ("WebP", "*.webp"),
+            ],
         )
         if not out:
             return
 
-        self.clean_image.save(out)
-        self.status.config(text=f"Saved: {os.path.basename(out)}")
+        try:
+            save_image_safely(self.clean_image, out, jpg_bg=(255, 255, 255))
+            self.status.config(text=f"Saved: {os.path.basename(out)}")
+        except Exception as e:
+            messagebox.showerror("Save error", str(e))
 
 
 # =========================================================
